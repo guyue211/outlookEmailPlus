@@ -26,7 +26,8 @@ def _cmd_install(name: str, url: str | None) -> int:
         return 1
 
     try:
-        result = install_plugin(name, url=url)
+        # 命令行是显式的本地操作，允许走自定义来源；仍会经过地址校验与源码审计。
+        result = install_plugin(name, url=url, allow_custom=bool(url))
     except PluginManagerError as exc:
         print(f"[错误] {exc.code}: {exc.message}")
         return 1

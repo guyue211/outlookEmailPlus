@@ -294,6 +294,21 @@ POST /api/system/reload-plugins
 }
 ```
 
+> **安装链安全约束（v2.9.11 起）**
+>
+> - `POST /api/plugins/install` **不再接受**请求体中的 `url`，安装源只能是 registry 中登记
+>   的 `download_url`。返回 `PLUGIN_CUSTOM_URL_DISABLED`。
+> - 自定义来源安装只能通过命令行显式执行：
+>   `python -m outlook_web.services.temp_mail_plugin_cli install-provider <name> --from <url>`。
+> - 下载地址仅允许 `http`/`https`；自定义来源额外拒绝回环、私网、链路本地与云元数据地址。
+> - 插件名限定为 `[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}`，不允许路径分隔符。
+> - 下方「源码审计」规则对 registry 条目未声明 `sha256` 的情况同样生效。
+>
+> **源码审计拒绝项**：导入 `subprocess` / `ctypes` / `pty` / `multiprocessing` / `socket` /
+> `pickle` / `marshal`；调用 `eval` / `exec` / `compile` / `__import__` / `system` / `popen` /
+> `execv` / `spawnl` / `exec_module`；非 UTF-8、语法错误、未继承 `TempMailProviderBase`
+> 或未使用 `@register_provider`。插件应只做 HTTP 请求与数据转换，不在模块顶层执行副作用。
+
 ---
 
 ## 7. 当前真实 UI / API 行为

@@ -2,6 +2,12 @@
 
 All notable changes to OutlookMail Plus are documented in this file.
 
+## [未发布]
+
+### 安全 / Security
+
+- **插件安装链远程代码执行修复（P0）**：`POST /api/plugins/install` 的自定义 `url` 参数可让服务端从任意地址下载 `.py`，配合 `POST /api/system/reload-plugins` 的 `exec_module` 在进程内以 root 执行代码。现关闭 HTTP 侧自定义 URL 通道，自定义来源安装收敛到命令行工具；下载地址限制为 http/https 并拦截回环、私网与云元数据地址；插件名增加白名单与目录穿越校验；新增基于 `ast` 的源码审计；插件源声明 sha256 时必须匹配，未声明时改用源码审计；加载器拒绝符号链接。详见 `docs/BUG/2026-10-25-临时邮箱Provider插件安装RCE安全缺陷BUG.md`。
+
 ## [v2.9.11] - 2026-08-24
 
 ### 修复 / Bug Fixes

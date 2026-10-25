@@ -73,8 +73,18 @@ def api_install_plugin(body: dict[str, Any]):
         payload = build_error_payload("INVALID_PARAMS", "缺少插件名称", status=400)
         return {"success": False, "error": payload}, 400
 
+    # HTTP 接口不接受自定义下载地址：安装源必须是服务端登记的官方插件源。
+    # 自定义来源的安装只能通过命令行工具（temp_mail_plugin_cli --from）显式执行。
+    if url:
+        payload = build_error_payload(
+            "PLUGIN_CUSTOM_URL_DISABLED",
+            "接口不接受自定义下载地址，请通过官方插件源安装",
+            status=400,
+        )
+        return {"success": False, "error": payload}, 400
+
     try:
-        result = install_plugin(name, url=url)
+        result = install_plugin(name)
         message = "插件安装成功，请点击「应用变更」使其生效"
         deps = result.get("dependencies") or []
         if isinstance(deps, list) and deps:

@@ -28,7 +28,7 @@ class TestPluginCLI(unittest.TestCase):
         from outlook_web.services.temp_mail_plugin_cli import _cmd_install
 
         _cmd_install("moemail", None)
-        mock_install.assert_called_once_with("moemail", url=None)
+        mock_install.assert_called_once_with("moemail", url=None, allow_custom=False)
 
     # G-CLI-02
     @patch("outlook_web.services.temp_mail_plugin_cli.install_plugin")
@@ -41,7 +41,7 @@ class TestPluginCLI(unittest.TestCase):
         from outlook_web.services.temp_mail_plugin_cli import _cmd_install
 
         _cmd_install("moemail", "https://example.com/plugin.py")
-        mock_install.assert_called_once_with("moemail", url="https://example.com/plugin.py")
+        mock_install.assert_called_once_with("moemail", url="https://example.com/plugin.py", allow_custom=True)
 
     # G-CLI-03
     @patch("outlook_web.services.temp_mail_plugin_cli.uninstall_plugin")

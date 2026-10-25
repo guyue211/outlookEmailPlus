@@ -79,6 +79,13 @@ def load_plugins() -> list[dict[str, Any]]:
         except OSError:
             continue
 
+        # 插件目录内的符号链接一律不加载：避免把目录外文件带进进程
+        if py_file.is_symlink():
+            failure = {"name": name, "status": "failed", "error": "SecurityError: 插件文件是符号链接，拒绝加载"}
+            results.append(failure)
+            _PLUGIN_LOAD_STATE[name] = dict(failure)
+            continue
+
         # 文件未变化且上次失败：跳过重复尝试（测试/生产都可降低噪音）
         if _FAILED_PLUGIN_MTIMES.get(file_key) == mtime_ns:
             cached = _PLUGIN_LOAD_STATE.get(name)

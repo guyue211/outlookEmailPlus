@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import ast
 import hashlib
+import ipaddress
 import json
 import logging
+import re
+import socket
 import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from requests import RequestException, Timeout
@@ -92,16 +97,168 @@ def get_available_plugins() -> list[dict[str, Any]]:
     return list(_AVAILABLE_PLUGINS_CACHE)
 
 
-def install_plugin(name: str, *, url: str | None = None) -> dict[str, Any]:
+_PLUGIN_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
+
+
+def _validate_plugin_name(plugin_name: str) -> str:
+    """插件名只能是安全的文件主名，禁止路径分隔符与目录穿越。"""
+    if not _PLUGIN_NAME_RE.match(plugin_name) or ".." in plugin_name:
+        raise PluginManagerError(
+            "INVALID_PLUGIN_NAME",
+            "插件名称只能包含字母、数字、下划线、点与连字符，且不能包含路径分隔符",
+            status=400,
+        )
+    return plugin_name
+
+
+def _resolve_plugin_target(plugin_dir: Path, plugin_name: str) -> Path:
+    """把插件名解析为插件目录内的目标路径，并确认没有逃逸出该目录。"""
+    target = (plugin_dir / f"{plugin_name}.py").resolve()
+    if target.parent != plugin_dir.resolve():
+        raise PluginManagerError("INVALID_PLUGIN_NAME", "插件路径越界", status=400)
+    return target
+
+
+def _check_download_url(download_url: str, *, from_registry: bool) -> str:
+    """限制下载地址：仅 http/https，禁止指向本机、内网与云元数据地址。"""
+    try:
+        parsed = urlparse(download_url)
+    except ValueError:
+        raise PluginManagerError("PLUGIN_URL_INVALID", "插件下载地址无效", status=400)
+
+    if parsed.scheme not in ("http", "https"):
+        raise PluginManagerError(
+            "PLUGIN_URL_INVALID",
+            f"不支持的下载协议: {parsed.scheme or '(空)'}，仅允许 http/https",
+            status=400,
+        )
+    if not parsed.hostname:
+        raise PluginManagerError("PLUGIN_URL_INVALID", "下载地址缺少主机名", status=400)
+
+    if not from_registry and _is_blocked_host(parsed.hostname):
+        raise PluginManagerError(
+            "PLUGIN_URL_BLOCKED",
+            f"自定义安装不允许指向本机或内网地址: {parsed.hostname}",
+            status=400,
+        )
+    return download_url
+
+
+def _is_blocked_host(hostname: str) -> bool:
+    """判断主机名是否属于回环/内网/链路本地/元数据等敏感地址。"""
+    host = (hostname or "").strip().strip("[]").lower()
+    if not host:
+        return True
+    if host in {"localhost", "localhost.localdomain", "ip6-localhost", "metadata", "metadata.google.internal"}:
+        return True
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        # 域名解析不出来时不拦截，交给下载阶段报错
+        return False
+
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return True
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            return True
+    return False
+
+
+def _audit_plugin_source(content: bytes, *, plugin_name: str) -> None:
+    """安装前静态审计：自定义来源的插件不得出现明显的命令执行/动态加载写法。"""
+    try:
+        source = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise PluginManagerError("PLUGIN_INVALID_CONTENT", "插件文件必须是 UTF-8 编码的 Python 源码", status=400)
+
+    try:
+        tree = ast.parse(source, filename=f"{plugin_name}.py")
+    except SyntaxError as exc:
+        raise PluginManagerError(
+            "PLUGIN_INVALID_CONTENT",
+            f"插件不是合法的 Python 源码: {exc.msg} (line {exc.lineno})",
+            status=400,
+        )
+
+    blocked_modules = {
+        "subprocess",
+        "ctypes",
+        "pty",
+        "multiprocessing",
+        "socket",
+        "pickle",
+        "marshal",
+    }
+    blocked_calls = {"eval", "exec", "compile", "__import__", "system", "popen", "execv", "spawnl", "exec_module"}
+
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root in blocked_modules:
+                    findings.append(f"line {node.lineno}: import {alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if root in blocked_modules:
+                findings.append(f"line {node.lineno}: from {node.module} import ...")
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in blocked_calls:
+                findings.append(f"line {node.lineno}: {func.id}(...)")
+            elif isinstance(func, ast.Attribute) and func.attr in blocked_calls:
+                findings.append(f"line {getattr(func, 'lineno', node.lineno)}: .{func.attr}(...)")
+        elif isinstance(node, ast.Attribute):
+            if node.attr in {"os_system", "shell"} and getattr(node, "lineno", None):
+                findings.append(f"line {node.lineno}: .{node.attr}")
+
+    if findings:
+        detail = "; ".join(findings[:5])
+        raise PluginManagerError(
+            "PLUGIN_SOURCE_REJECTED",
+            f"插件源码包含被禁止的高危调用: {detail}",
+            status=400,
+        )
+
+    if not re.search(r"@\s*register_provider|TempMailProviderBase", source):
+        raise PluginManagerError(
+            "PLUGIN_INVALID_CONTENT",
+            "插件未实现 TempMailProviderBase 或未使用 @register_provider 注册",
+            status=400,
+        )
+
+
+def install_plugin(name: str, *, url: str | None = None, allow_custom: bool = False) -> dict[str, Any]:
     plugin_name = str(name or "").strip()
     if not plugin_name:
         raise PluginManagerError("INVALID_PARAMS", "缺少插件名称", status=400)
+    plugin_name = _validate_plugin_name(plugin_name)
 
     plugin_dir = _ensure_plugin_dir()
-    target = plugin_dir / f"{plugin_name}.py"
+    target = _resolve_plugin_target(plugin_dir, plugin_name)
+
+    custom_source = bool(url)
+    if custom_source and not allow_custom:
+        raise PluginManagerError(
+            "PLUGIN_CUSTOM_URL_DISABLED",
+            "自定义 URL 安装已禁用，请通过官方插件源安装或使用命令行工具",
+            status=403,
+        )
 
     entry: dict[str, Any] | None = None
-    if url:
+    if custom_source:
         download_url = str(url).strip()
     else:
         available = get_available_plugins()
@@ -112,6 +269,7 @@ def install_plugin(name: str, *, url: str | None = None) -> dict[str, Any]:
 
     if not download_url:
         raise PluginManagerError("PLUGIN_NO_URL", "未提供下载地址", status=400)
+    download_url = _check_download_url(download_url, from_registry=not custom_source)
 
     try:
         resp = requests.get(download_url, timeout=30)
@@ -123,10 +281,12 @@ def install_plugin(name: str, *, url: str | None = None) -> dict[str, Any]:
 
     content = resp.content
 
-    # registry 安装时做完整性校验；自定义 URL 跳过
-    if url is None and entry is not None:
+    # 官方插件源安装：sha256 若声明就必须匹配；未声明时同样走源码审计，
+    # 不允许出现「源里没写 sha256 即完全不校验」的绕过口子。
+    if entry is not None:
         expected_sha = str(entry.get("sha256") or "").strip().lower()
-        if expected_sha and len(expected_sha) == 64 and all(ch in "0123456789abcdef" for ch in expected_sha):
+        has_sha = len(expected_sha) == 64 and all(ch in "0123456789abcdef" for ch in expected_sha)
+        if has_sha:
             actual_sha = hashlib.sha256(content).hexdigest().lower()
             if actual_sha != expected_sha:
                 raise PluginManagerError(
@@ -134,6 +294,12 @@ def install_plugin(name: str, *, url: str | None = None) -> dict[str, Any]:
                     f"文件完整性校验失败: 期望 {expected_sha[:12]}..., 实际 {actual_sha[:12]}...",
                     status=400,
                 )
+        else:
+            _audit_plugin_source(content, plugin_name=plugin_name)
+            logger.warning("[plugin] 插件源未提供 sha256，已改用源码审计: %s", plugin_name)
+    else:
+        _audit_plugin_source(content, plugin_name=plugin_name)
+        logger.warning("[plugin] 以自定义来源安装插件 %s（已通过源码审计）: %s", plugin_name, download_url)
 
     target.write_bytes(content)
     logger.info("[plugin] 已安装: %s -> %s", plugin_name, target)

@@ -105,7 +105,24 @@ class TestPluginManagerInstall(unittest.TestCase):
     # D-INST-02
     @patch("outlook_web.services.temp_mail_plugin_manager.requests")
     def test_install_from_custom_url(self, mock_requests):
-        """从自定义 URL 安装"""
+        """自定义 URL 默认被拒绝（接口层共用该默认值）"""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = MOCK_PROVIDER_CODE
+        mock_resp.raise_for_status = MagicMock()
+        mock_requests.get.return_value = mock_resp
+
+        from outlook_web.services.temp_mail_plugin_manager import PluginManagerError, install_plugin
+
+        with self.assertRaises(PluginManagerError) as ctx:
+            install_plugin("custom_one", url="http://example.com/custom.py")
+        self.assertEqual(ctx.exception.code, "PLUGIN_CUSTOM_URL_DISABLED")
+        self.assertFalse((self._tmp_dir / "custom_one.py").exists())
+        mock_requests.get.assert_not_called()
+
+    @patch("outlook_web.services.temp_mail_plugin_manager.requests")
+    def test_install_from_custom_url_with_explicit_optin(self, mock_requests):
+        """命令行显式授权时才允许自定义 URL 安装"""
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.content = MOCK_PROVIDER_CODE
@@ -114,7 +131,7 @@ class TestPluginManagerInstall(unittest.TestCase):
 
         from outlook_web.services.temp_mail_plugin_manager import install_plugin
 
-        result = install_plugin("custom_one", url="http://example.com/custom.py")
+        result = install_plugin("custom_one", url="http://example.com/custom.py", allow_custom=True)
         self.assertEqual(result["plugin_name"], "custom_one")
         self.assertTrue((self._tmp_dir / "custom_one.py").exists())
 
@@ -678,6 +695,183 @@ class TestPluginManagerConnection(unittest.TestCase):
         result = test_plugin_connection("any_provider")
         self.assertIsInstance(result["latency_ms"], int)
         self.assertGreaterEqual(result["latency_ms"], 0)
+
+
+class TestPluginInstallHardening(unittest.TestCase):
+    """安装链安全加固：名字、路径、下载地址、源码审计、加载器。"""
+
+    def setUp(self):
+        from tests._import_app import import_web_app_module
+
+        self._app_mod = import_web_app_module()
+        self._app = self._app_mod.app
+        base = Path(self._app_mod.app.config["DATABASE_PATH"]).parent
+        self._tmp_dir = base / "plugins" / "temp_mail_providers"
+        self._tmp_dir.mkdir(parents=True, exist_ok=True)
+        self._registry_file = base / "plugins" / "registry.json"
+        self._registry_file.parent.mkdir(parents=True, exist_ok=True)
+        self._registry_file.write_text(json.dumps({"version": 1, "plugins": []}), encoding="utf-8")
+
+    def tearDown(self):
+        from outlook_web.services.temp_mail_provider_base import _REGISTRY
+        from outlook_web.services.temp_mail_provider_factory import _BUILTIN_PROVIDERS
+
+        for key in list(_REGISTRY.keys()):
+            if key not in _BUILTIN_PROVIDERS:
+                _REGISTRY.pop(key, None)
+        for key in list(sys.modules.keys()):
+            if key.startswith("_plugin_"):
+                del sys.modules[key]
+        for f in self._tmp_dir.glob("*.py"):
+            f.unlink(missing_ok=True)
+        if self._registry_file.exists():
+            self._registry_file.unlink()
+
+    def _mock_resp(self, content: bytes):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.content = content
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    # 名称与路径
+    def test_reject_path_traversal_name(self):
+        from outlook_web.services.temp_mail_plugin_manager import PluginManagerError, install_plugin
+
+        for bad in ("../../evil", "a/b", "..", "x\\y", ".", ""):
+            with self.assertRaises(PluginManagerError) as ctx:
+                install_plugin(bad, url="http://example.com/x.py", allow_custom=True)
+            self.assertIn(ctx.exception.code, {"INVALID_PARAMS", "INVALID_PLUGIN_NAME"})
+
+    def test_name_allows_plain_identifier(self):
+        from outlook_web.services.temp_mail_plugin_manager import _validate_plugin_name
+
+        for good in ("my_provider", "provider-2", "a.b"):
+            self.assertEqual(_validate_plugin_name(good), good)
+
+    def test_target_stays_inside_plugin_dir(self):
+        from outlook_web.services.temp_mail_plugin_manager import _resolve_plugin_target
+
+        target = _resolve_plugin_target(self._tmp_dir, "ok_name")
+        self.assertEqual(target.parent, self._tmp_dir.resolve())
+
+    # 下载地址
+    def test_block_non_http_scheme(self):
+        from outlook_web.services.temp_mail_plugin_manager import PluginManagerError, _check_download_url
+
+        for bad in ("file:///etc/passwd", "ftp://example.com/a.py", "gopher://x/a", "data:text/plain,x"):
+            with self.assertRaises(PluginManagerError) as ctx:
+                _check_download_url(bad, from_registry=False)
+            self.assertEqual(ctx.exception.code, "PLUGIN_URL_INVALID")
+
+    def test_block_internal_hosts_for_custom_source(self):
+        from outlook_web.services.temp_mail_plugin_manager import PluginManagerError, _check_download_url
+
+        for bad in (
+            "http://127.0.0.1/a.py",
+            "http://localhost/a.py",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/a.py",
+            "http://192.168.1.1/a.py",
+            "http://[::1]/a.py",
+        ):
+            with self.assertRaises(PluginManagerError) as ctx:
+                _check_download_url(bad, from_registry=False)
+            self.assertEqual(ctx.exception.code, "PLUGIN_URL_BLOCKED")
+
+    def test_public_url_passes(self):
+        from outlook_web.services.temp_mail_plugin_manager import _check_download_url
+
+        url = "https://plugins.example.com/p.py"
+        self.assertEqual(_check_download_url(url, from_registry=False), url)
+
+    # 源码审计
+    def test_audit_rejects_command_execution(self):
+        from outlook_web.services.temp_mail_plugin_manager import PluginManagerError, _audit_plugin_source
+
+        payload = b"""
+import subprocess
+from outlook_web.services.temp_mail_provider_base import TempMailProviderBase
+subprocess.run("id", shell=True)
+class P(TempMailProviderBase):
+    provider_name = "p"
+"""
+        with self.assertRaises(PluginManagerError) as ctx:
+            _audit_plugin_source(payload, plugin_name="p")
+        self.assertEqual(ctx.exception.code, "PLUGIN_SOURCE_REJECTED")
+
+    def test_audit_rejects_eval_and_dunder_import(self):
+        from outlook_web.services.temp_mail_plugin_manager import PluginManagerError, _audit_plugin_source
+
+        for payload in (
+            b"__import__('os').system('id')\nclass P: pass\nTempMailProviderBase\n",
+            b"eval('1+1')\nclass P: pass\nTempMailProviderBase\n",
+        ):
+            with self.assertRaises(PluginManagerError) as ctx:
+                _audit_plugin_source(payload, plugin_name="p")
+            self.assertEqual(ctx.exception.code, "PLUGIN_SOURCE_REJECTED")
+
+    def test_audit_rejects_syntax_error(self):
+        from outlook_web.services.temp_mail_plugin_manager import PluginManagerError, _audit_plugin_source
+
+        with self.assertRaises(PluginManagerError) as ctx:
+            _audit_plugin_source(b"def broken(:\n", plugin_name="broken")
+        self.assertEqual(ctx.exception.code, "PLUGIN_INVALID_CONTENT")
+
+    def test_audit_rejects_non_provider_module(self):
+        from outlook_web.services.temp_mail_plugin_manager import PluginManagerError, _audit_plugin_source
+
+        with self.assertRaises(PluginManagerError) as ctx:
+            _audit_plugin_source(b"X = 1\n", plugin_name="noop")
+        self.assertEqual(ctx.exception.code, "PLUGIN_INVALID_CONTENT")
+
+    def test_audit_accepts_legit_provider(self):
+        from outlook_web.services.temp_mail_plugin_manager import _audit_plugin_source
+
+        _audit_plugin_source(MOCK_PROVIDER_CODE, plugin_name="mock_mgr")
+
+    # 端到端：恶意插件既下不来也装不上
+    @patch("outlook_web.services.temp_mail_plugin_manager.requests")
+    def test_custom_url_payload_not_downloaded(self, mock_requests):
+        from outlook_web.services.temp_mail_plugin_manager import PluginManagerError, install_plugin
+
+        mock_requests.get.return_value = self._mock_resp(b"import subprocess\nsubprocess.run('id')\n")
+        with self.assertRaises(PluginManagerError) as ctx:
+            install_plugin("evil", url="http://example.com/evil.py")
+        self.assertEqual(ctx.exception.code, "PLUGIN_CUSTOM_URL_DISABLED")
+        mock_requests.get.assert_not_called()
+        self.assertFalse((self._tmp_dir / "evil.py").exists())
+
+    @patch("outlook_web.services.temp_mail_plugin_manager.requests")
+    def test_optin_still_audits_payload(self, mock_requests):
+        from outlook_web.services.temp_mail_plugin_manager import PluginManagerError, install_plugin
+
+        mock_requests.get.return_value = self._mock_resp(
+            b"import subprocess\nfrom outlook_web.services.temp_mail_provider_base import TempMailProviderBase\n"
+            b"subprocess.run('id', shell=True)\nclass P(TempMailProviderBase): pass\n"
+        )
+        with self.assertRaises(PluginManagerError) as ctx:
+            install_plugin("evil2", url="http://example.com/evil.py", allow_custom=True)
+        self.assertEqual(ctx.exception.code, "PLUGIN_SOURCE_REJECTED")
+        self.assertFalse((self._tmp_dir / "evil2.py").exists())
+
+    # 加载器：符号链接不加载
+    def test_loader_skips_symlink(self):
+        from outlook_web.services.temp_mail_provider_factory import load_plugins
+
+        outside = self._tmp_dir.parent / "outside.py"
+        outside.write_text(MOCK_PROVIDER_CODE.decode("utf-8"), encoding="utf-8")
+        link = self._tmp_dir / "linked.py"
+        link.symlink_to(outside)
+        try:
+            results = load_plugins()
+            entry = next((r for r in results if r["name"] == "linked"), None)
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry["status"], "failed")
+            self.assertIn("符号链接", entry["error"])
+        finally:
+            link.unlink(missing_ok=True)
+            outside.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
